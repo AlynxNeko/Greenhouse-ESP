@@ -37,6 +37,9 @@ const int RACK_COUNT = 8;
 int currentRack = 1;            // Current top rack (1-8)
 float rackM[RACK_COUNT];        // Current estimated moisture (% dry basis)
 float rack_k_multiplier[RACK_COUNT]; // Relative exposure multipliers
+enum OpMode { AUTO = 0, SEMI = 1, NOTIFY = 2 };
+OpMode currentMode = AUTO; // Default Automatic
+// Ganti initialMoisturePercent agar bisa diubah
 float initialMoisturePercent = 13.0;
 const float M_TARGET = 12.0;
 
@@ -145,6 +148,9 @@ void shiftExposureMultipliers(bool clockwise=true) {
 
 // Check if drying is uneven and rotate if necessary
 bool maybeRotateAndActuate() {
+  // Jika mode NOTIFY, tidak melakukan apa-apa
+  if (currentMode == NOTIFY) return false;
+
   float maxM = rackM[0], minM = rackM[0];
   for (int i=0; i<RACK_COUNT; i++) { 
     maxM = max(maxM, rackM[i]); 
@@ -152,9 +158,17 @@ bool maybeRotateAndActuate() {
   }
   float diff = maxM - minM;
 
-  if (diff > 1.0f || maxM > (M_TARGET + 1.0f)) {
-    Serial.println("Decision: rotate to balance racks");
-    rotateStepper(512, true); // ~45 degrees
+  bool needRotation = (diff > 1.0f || maxM > (M_TARGET + 1.0f));
+
+  // Jika mode SEMI, kita hanya kirim status "Need Rotation" tapi tidak gerak otomatis
+  // (Akan ditangani logic pengiriman packet, di sini return false agar motor diam)
+  if (currentMode == SEMI) {
+     return false; 
+  }
+
+  // Jika mode AUTO, lakukan aksi fisik
+  if (needRotation) {
+    rotateStepper(512, true);
     shiftExposureMultipliers(true);
     return true;
   }
@@ -201,40 +215,42 @@ void setup() {
 
 // Calculates EMC based on current sensor readings and sends packet
 void sendStatusPacket() {
+  // ... baca sensor ...
   float T = bme.readTemperature();
   float H = bme.readHumidity();
-  float emc = calculateEMC(T, H); // Calculate REAL EMC
+  float emc = calculateEMC(T, H);
   bool fanStatus = digitalRead(FAN_PIN);
 
-  // --- 1. Build Standard Status String ---
-  // Format: "STATUS:T=25.50;H=60.00;EMC=15.00;RACK=1;FAN=1;PRED=0;"
-  String payload = "STATUS:T=";
-  payload += String(T, 2);
-  payload += ";H=";
-  payload += String(H, 2);
-  payload += ";EMC=";
-  payload += String(emc, 2);
-  payload += ";RACK=";
-  payload += String(currentRack);
-  payload += ";FAN=";
-  payload += fanStatus ? "1" : "0";
-  payload += ";PRED=0;"; // Flutter expects this field, but we append data after it
+  // Prediksi waktu kering (simple estimation)
+  float avgM = 0;
+  for(float m : rackM) avgM += m;
+  avgM /= RACK_COUNT;
+  int predMins = (avgM > M_TARGET) ? (int)((avgM - M_TARGET) / (k_base_min * 100)) : 0; 
 
-  // --- 2. APPEND MOISTURE DATA ---
-  // This adds: "13.5,13.2,12.9..." to the end of the string
+  // --- FIX: Membangun String dengan aman ---
+  String payload = "STATUS:T=" + String(T, 2);
+  payload += ";H=" + String(H, 2);
+  payload += ";EMC=" + String(emc, 2);
+  payload += ";RACK=" + String(currentRack);
+  
+  // Perbaikan di sini: Pisahkan penambahan string atau gunakan String()
+  payload += ";FAN=";
+  payload += (fanStatus ? "1" : "0");
+  
+  payload += ";PRED=" + String(predMins);
+  payload += ";MODE=" + String(currentMode);
+
+  // Append data moisture tiap rak
+  payload += ";M_DATA="; 
   for (int i = 0; i < RACK_COUNT; i++) {
     payload += String(rackM[i], 2);
     if (i < RACK_COUNT - 1) payload += ",";
   }
 
-  // --- 3. Send via LoRa ---
-  Serial.print("TX LoRa: ");
-  Serial.println(payload);
-
   LoRa.beginPacket();
   LoRa.print(payload);
   LoRa.endPacket();
-  LoRa.receive(); // Back to listen mode
+  LoRa.receive();
 }
 
 void processCommand(String cmd) {
@@ -243,6 +259,8 @@ void processCommand(String cmd) {
   if (cmd == "REQSTATUS") {
     sendStatusPacket();
   } 
+  // Ganti logic FAN agar menghormati mode jika perlu, 
+  // tapi biasanya manual override (tombol app) tetap jalan di semua mode.
   else if (cmd == "FANON") {
     digitalWrite(FAN_PIN, HIGH);
     sendStatusPacket(); 
@@ -252,21 +270,34 @@ void processCommand(String cmd) {
     sendStatusPacket();
   }
   else if (cmd == "NEXT") {
+    // Manual step
     rotateStepper(512, true);
     shiftExposureMultipliers(true);
     sendStatusPacket();
   }
   else if (cmd.startsWith("STEP:")) {
-    // Manual rotation via app
     int angle = cmd.substring(5).toInt();
-    // For simplicity, assume mostly manual tweaks or full steps
-    // This will spin the motor without updating logic (unless it's a multiple of 45)
-    // You can enhance this if needed.
     bool cw = angle >= 0;
-    // Approx steps for angle (512 steps = ~45 deg)
     int steps = abs(angle) * (512.0 / 45.0);
     rotateStepper(steps, cw);
     sendStatusPacket(); 
+  }
+  // --- COMMAND BARU ---
+  else if (cmd.startsWith("SETMODE:")) {
+    int m = cmd.substring(8).toInt();
+    if (m >= 0 && m <= 2) {
+      currentMode = (OpMode)m;
+      sendStatusPacket();
+    }
+  }
+  else if (cmd.startsWith("SETMOIST:")) {
+    float m = cmd.substring(9).toFloat();
+    if (m > 0) {
+      initialMoisturePercent = m;
+      // Reset current calculation logic
+      for (int i = 0; i < RACK_COUNT; i++) rackM[i] = m;
+      sendStatusPacket();
+    }
   }
 }
 

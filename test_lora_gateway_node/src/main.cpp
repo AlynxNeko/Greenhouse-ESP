@@ -36,16 +36,12 @@ void loop() {
   if (SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
     cmd.trim();
-    
     if (cmd.length() > 0) {
-      Serial.print("BT -> LoRa: ");
-      Serial.println(cmd);
-      
       // Forward command to Sensor via LoRa
       LoRa.beginPacket();
       LoRa.print(cmd);
       LoRa.endPacket();
-      LoRa.receive(); // Switch back to receive mode immediately
+      LoRa.receive(); 
     }
   }
 
@@ -59,11 +55,16 @@ void loop() {
     msg.trim();
 
     if (msg.length() > 0) {
-      Serial.print("LoRa -> BT: ");
-      Serial.println(msg);
+      // --- TAMBAHAN: Ambil data Sinyal ---
+      int rssi = LoRa.packetRssi();
+      float snr = LoRa.packetSnr();
+
+      // Append ke pesan: "...;RSSI=-80;SNR=9.25"
+      msg += ";RSSI=" + String(rssi);
+      msg += ";SNR=" + String(snr, 2);
       
-      // Forward status to Flutter via Bluetooth
-      SerialBT.println(msg); 
+      SerialBT.println(msg); // Kirim ke Flutter
+      Serial.println("Relay: " + msg);
     }
   }
 }
