@@ -1,3 +1,4 @@
+// [File: alynxneko/greenhouse-esp/Greenhouse-ESP-ce21ed56fcbaa14510252b1a6bbbb5005a9de09e/test_lora_sensor_node_auto/src/main.cpp]
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
@@ -24,6 +25,7 @@ Adafruit_BME280 bme;
 // --- Timing ---
 #define SEND_INTERVAL (10 * 1000UL)  // 10 seconds update interval
 unsigned long lastSend = 0;
+unsigned long lastRotationTime = 0; // For tracking rotation intervals
 
 // --- Stepper Sequence (Half-step) ---
 const uint8_t seq[8][4] = {
@@ -32,39 +34,43 @@ const uint8_t seq[8][4] = {
 };
 
 // ------------------ DRYING MODEL PARAMETERS ------------------
-const float k_base_min = 0.003; // Drying rate constant (per minute)
+// k value for Lewis model (approximate for coffee drying, adjust based on experiments)
+const float k_drying = 0.0025; 
 const int RACK_COUNT = 8;
-int currentRack = 1;            // Current top rack (1-8)
-float rackM[RACK_COUNT];        // Current estimated moisture (% dry basis)
-float rack_k_multiplier[RACK_COUNT]; // Relative exposure multipliers
+int currentRack = 1;            
+float rackM[RACK_COUNT];        
+float rack_k_multiplier[RACK_COUNT]; 
 enum OpMode { AUTO = 0, SEMI = 1, NOTIFY = 2 };
-OpMode currentMode = AUTO; // Default Automatic
-// Ganti initialMoisturePercent agar bisa diubah
-float initialMoisturePercent = 13.0;
+OpMode currentMode = AUTO; 
+float initialMoisturePercent = 15.0; // Default initial
 const float M_TARGET = 12.0;
+
+// Temp Thresholds for Logic
+const float TEMP_HOT = 30.0;
+const float TEMP_COOL = 25.0;
 
 // GAB Model Parameters for EMC Calculation
 struct GabParams { float M0; float C; float K; float T; };
 const GabParams gabTable[] = {
-  {3.98, 0.94, 0.87, 25.0},
-  {3.55, 0.95, 0.89, 32.0},
-  {3.26, 0.97, 0.91, 39.0}
+  // { M0,   C,    K,    T }
+  {5.50, 20.0, 0.88, 25.0}, // At 25°C
+  {5.00, 18.0, 0.86, 32.0}, // At 32°C
+  {4.50, 15.0, 0.84, 39.0}  // At 39°C
 };
 
 // ------------------ FUNCTION DECLARATIONS ------------------
 
 void initRackMultipliers() {
-  rack_k_multiplier[0] = 1.00; // Rack 1 (Top) - Best drying
+  rack_k_multiplier[0] = 1.00; 
   rack_k_multiplier[1] = 0.95;
   rack_k_multiplier[2] = 0.90;
   rack_k_multiplier[3] = 0.85;
   rack_k_multiplier[4] = 0.85;
   rack_k_multiplier[5] = 0.90;
   rack_k_multiplier[6] = 0.95;
-  rack_k_multiplier[7] = 1.00; // Rack 8 (Bottom) - Also good
+  rack_k_multiplier[7] = 1.00; 
 }
 
-// Interpolate GAB parameters based on Temperature
 GabParams interpGabParams(float T) {
   if (T <= gabTable[0].T) return gabTable[0];
   if (T >= gabTable[2].T) return gabTable[2];
@@ -84,10 +90,10 @@ GabParams interpGabParams(float T) {
   return gabTable[1];
 }
 
-// Calculate Equilibrium Moisture Content (EMC)
 float calculateEMC(float T, float RH) {
   float a_w = RH / 100.0f;
   if (a_w <= 0.0f) return 0.0f;
+  if (a_w >= 0.99f) a_w = 0.99f; // Prevent singularity
   GabParams p = interpGabParams(T);
   float denom = (1.0f - p.K * a_w);
   if (denom == 0.0f) denom = 1e-6;
@@ -95,15 +101,33 @@ float calculateEMC(float T, float RH) {
   return M;
 }
 
-// Update moisture of all racks based on EMC and time elapsed
 void updateRackMoistures(float Me, float dt_min) {
   for (int i = 0; i < RACK_COUNT; i++) {
-    float k_eff = k_base_min * rack_k_multiplier[i]; // effective rate per minute
+    float k_eff = k_drying * rack_k_multiplier[i]; 
+    // Lewis Model: M(t) = Me + (M0 - Me) * exp(-kt)
+    // Iterative: M_new = Me + (M_old - Me) * exp(-k * dt)
     float decay = expf(-k_eff * dt_min);
     float M_old = rackM[i];
     float M_new = Me + (M_old - Me) * decay;
     rackM[i] = M_new;
   }
+}
+
+// Formula 3.5 from Thesis: t* = -1/k * ln( (M_target - Me) / (M_current - Me) )
+int calculatePredTime(float M_current, float Me) {
+  if (M_current <= M_TARGET) return 0; // Already dry
+  if (Me >= M_TARGET) return 999; // Cannot dry to target with current air (EMC too high)
+  
+  float numerator = M_TARGET - Me;
+  float denominator = M_current - Me;
+  
+  if (denominator <= 0) return 999; // Should not happen if checks above pass
+
+  float ratio = numerator / denominator;
+  if (ratio <= 0) return 0; // Safety
+
+  float t_min = (-1.0f / k_drying) * log(ratio);
+  return (int)t_min;
 }
 
 // --- Stepper Logic ---
@@ -126,84 +150,75 @@ void rotateStepper(int steps, bool clockwise = true) {
       delay(stepDelay);
     }
   }
-  // Release coils
   digitalWrite(in1, LOW); digitalWrite(in2, LOW);
   digitalWrite(in3, LOW); digitalWrite(in4, LOW);
 }
 
-// Shift logic array when physical rack rotates
 void shiftExposureMultipliers(bool clockwise=true) {
+  // Simplified shift for visualization logic
   if (clockwise) {
     float last = rack_k_multiplier[RACK_COUNT-1];
     for (int i = RACK_COUNT-1; i>0; i--) rack_k_multiplier[i] = rack_k_multiplier[i-1];
     rack_k_multiplier[0] = last;
     currentRack = (currentRack % RACK_COUNT) + 1; 
-  } else {
-    float first = rack_k_multiplier[0];
-    for (int i=0;i<RACK_COUNT-1;i++) rack_k_multiplier[i] = rack_k_multiplier[i+1];
-    rack_k_multiplier[RACK_COUNT-1] = first;
-    currentRack = (currentRack - 2 + RACK_COUNT) % RACK_COUNT + 1; 
   }
 }
 
-// Check if drying is uneven and rotate if necessary
-bool maybeRotateAndActuate() {
-  // Jika mode NOTIFY, tidak melakukan apa-apa
-  if (currentMode == NOTIFY) return false;
+// --- NEW AUTOMATIC LOGIC ---
+void processAutoLogic(float T) {
+  if (currentMode != AUTO) return;
 
-  float maxM = rackM[0], minM = rackM[0];
-  for (int i=0; i<RACK_COUNT; i++) { 
-    maxM = max(maxM, rackM[i]); 
-    minM = min(minM, rackM[i]); 
+  unsigned long now = millis();
+  unsigned long interval = 0;
+
+  // 1. Determine interval based on Temperature
+  if (T > TEMP_HOT) {
+    // HOT (>30): Fast rotation (e.g., every 30 secs)
+    interval = 30 * 1000UL; 
+  } else if (T >= TEMP_COOL) {
+    // AVERAGE (25-30): Medium rotation (e.g., every 2 mins)
+    interval = 2 * 60 * 1000UL;
+  } else {
+    // COOL (<25): Slow rotation (e.g., every 10 mins)
+    interval = 10 * 60 * 1000UL;
   }
-  float diff = maxM - minM;
 
-  bool needRotation = (diff > 1.0f || maxM > (M_TARGET + 1.0f));
-
-  // Jika mode SEMI, kita hanya kirim status "Need Rotation" tapi tidak gerak otomatis
-  // (Akan ditangani logic pengiriman packet, di sini return false agar motor diam)
-  if (currentMode == SEMI) {
-     return false; 
+  // 2. Check time
+  if (now - lastRotationTime > interval) {
+    lastRotationTime = now;
+    Serial.println("Auto Logic: Rotating 180 deg...");
+    // 180 degrees = approx 2048 steps (assuming 4096 per rev)
+    rotateStepper(2048, true); 
+    shiftExposureMultipliers(true); 
+    shiftExposureMultipliers(true); // Shift logic twice since we moved 180 deg? (depends on logic mapping)
+    // Actually just shift once per significant move for simplicity or align with steps
   }
-
-  // Jika mode AUTO, lakukan aksi fisik
-  if (needRotation) {
-    rotateStepper(512, true);
-    shiftExposureMultipliers(true);
-    return true;
-  }
-  return false;
 }
 
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
   
-  // Hardware Init
   pinMode(FAN_PIN, OUTPUT);
   pinMode(in1, OUTPUT); pinMode(in2, OUTPUT); pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
   
-  // LoRa Init
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(433E6)) {
     Serial.println("LoRa init failed!");
     while (1);
   }
   LoRa.setTxPower(20);
-  LoRa.setSpreadingFactor(10);    // Was missing
-  LoRa.setSignalBandwidth(125E3); // Was missing
-  LoRa.setCodingRate4(5);         // Was missing
-  LoRa.enableCrc();               // Was missing
+  LoRa.setSpreadingFactor(10);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
   LoRa.receive();
 
-  // BME280 Init
-  // Uses default Wire pins (SDA=21, SCL=22) and Address 0x76
   if (!bme.begin(0x76, &Wire)) {
     Serial.println("BME init failed!");
     while (1);
   }
 
-  // Model Init
   initRackMultipliers();
   for (int i = 0; i < RACK_COUNT; i++) {
       rackM[i] = initialMoisturePercent;
@@ -212,35 +227,27 @@ void setup() {
 }
 
 // --- Communications ---
-
-// Calculates EMC based on current sensor readings and sends packet
 void sendStatusPacket() {
-  // ... baca sensor ...
   float T = bme.readTemperature();
   float H = bme.readHumidity();
   float emc = calculateEMC(T, H);
   bool fanStatus = digitalRead(FAN_PIN);
 
-  // Prediksi waktu kering (simple estimation)
+  // Average Moisture
   float avgM = 0;
   for(float m : rackM) avgM += m;
   avgM /= RACK_COUNT;
-  int predMins = (avgM > M_TARGET) ? (int)((avgM - M_TARGET) / (k_base_min * 100)) : 0; 
 
-  // --- FIX: Membangun String dengan aman ---
+  // New Prediction Calculation
+  int predMins = calculatePredTime(avgM, emc);
+
   String payload = "STATUS:T=" + String(T, 2);
   payload += ";H=" + String(H, 2);
   payload += ";EMC=" + String(emc, 2);
   payload += ";RACK=" + String(currentRack);
-  
-  // Perbaikan di sini: Pisahkan penambahan string atau gunakan String()
-  payload += ";FAN=";
-  payload += (fanStatus ? "1" : "0");
-  
+  payload += ";FAN=" + String(fanStatus ? "1" : "0");
   payload += ";PRED=" + String(predMins);
   payload += ";MODE=" + String(currentMode);
-
-  // Append data moisture tiap rak
   payload += ";M_DATA="; 
   for (int i = 0; i < RACK_COUNT; i++) {
     payload += String(rackM[i], 2);
@@ -259,8 +266,6 @@ void processCommand(String cmd) {
   if (cmd == "REQSTATUS") {
     sendStatusPacket();
   } 
-  // Ganti logic FAN agar menghormati mode jika perlu, 
-  // tapi biasanya manual override (tombol app) tetap jalan di semua mode.
   else if (cmd == "FANON") {
     digitalWrite(FAN_PIN, HIGH);
     sendStatusPacket(); 
@@ -270,8 +275,7 @@ void processCommand(String cmd) {
     sendStatusPacket();
   }
   else if (cmd == "NEXT") {
-    // Manual step
-    rotateStepper(512, true);
+    rotateStepper(512, true); // 45 deg
     shiftExposureMultipliers(true);
     sendStatusPacket();
   }
@@ -282,7 +286,6 @@ void processCommand(String cmd) {
     rotateStepper(steps, cw);
     sendStatusPacket(); 
   }
-  // --- COMMAND BARU ---
   else if (cmd.startsWith("SETMODE:")) {
     int m = cmd.substring(8).toInt();
     if (m >= 0 && m <= 2) {
@@ -294,7 +297,6 @@ void processCommand(String cmd) {
     float m = cmd.substring(9).toFloat();
     if (m > 0) {
       initialMoisturePercent = m;
-      // Reset current calculation logic
       for (int i = 0; i < RACK_COUNT; i++) rackM[i] = m;
       sendStatusPacket();
     }
@@ -309,40 +311,35 @@ void loop() {
     String msg = "";
     while (LoRa.available()) msg += (char)LoRa.read();
     msg.trim();
-    
     if (msg.length() > 0) {
       Serial.println("RX: " + msg);
       processCommand(msg);
     }
   }
 
-  // 2. Periodic Update (Drying Logic)
+  // 2. Periodic Logic
   unsigned long now = millis();
+  
+  // Read Environment continuously for Auto Logic
+  float T = bme.readTemperature();
+  float H = bme.readHumidity();
+  
+  // Execute Auto Rotation Logic
+  processAutoLogic(T);
+
+  // Fan Logic (Hysteresis)
+  if (currentMode == AUTO) {
+      if (H > 75.0f) digitalWrite(FAN_PIN, HIGH);
+      else if (H < 50.0f) digitalWrite(FAN_PIN, LOW);
+  }
+
+  // Periodic Update & Model Calc
   if ((now - lastSend) >= SEND_INTERVAL) {
     lastSend = now;
-
-    // Read Environment
-    float T = bme.readTemperature();
-    float H = bme.readHumidity();
     float emc = calculateEMC(T, H);
-    
-    // Calculate elapsed time in minutes
     float dt_min = (float)SEND_INTERVAL / 60000.0f;
-
-    // Update Drying Model
     updateRackMoistures(emc, dt_min);
-
-    // Actuation Logic
-    bool rotated = maybeRotateAndActuate();
-    
-    // Fan Logic (Simple hysteresis)
-    if (H > 75.0f) digitalWrite(FAN_PIN, HIGH);
-    else if (H < 40.0f) digitalWrite(FAN_PIN, LOW);
-
-    // Send Update to App (INCLUDES RACK DATA NOW)
     sendStatusPacket(); 
-    
-    // Debug Info
-    Serial.printf("T:%.2f H:%.2f EMC:%.2f Rotated:%d\n", T, H, emc, rotated);
+    Serial.printf("T:%.2f H:%.2f EMC:%.2f Pred:%d\n", T, H, emc, calculatePredTime(initialMoisturePercent, emc));
   }
 }
