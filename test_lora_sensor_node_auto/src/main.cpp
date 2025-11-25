@@ -26,6 +26,7 @@ Adafruit_BME280 bme;
 #define SEND_INTERVAL (10 * 1000UL)  // 10 seconds update interval
 unsigned long lastSend = 0;
 unsigned long lastRotationTime = 0; // For tracking rotation intervals
+bool autoSendEnabled = true;
 
 // --- Stepper Sequence (Half-step) ---
 const uint8_t seq[8][4] = {
@@ -48,6 +49,9 @@ const float M_TARGET = 12.0;
 // Temp Thresholds for Logic
 const float TEMP_HOT = 30.0;
 const float TEMP_COOL = 25.0;
+
+const int STEPS_PER_REV = 4096; 
+long currentStepPosition = 0;
 
 // GAB Model Parameters for EMC Calculation
 struct GabParams { float M0; float C; float K; float T; };
@@ -137,19 +141,31 @@ void stepMotor(int stepIndex) {
   digitalWrite(in3, seq[stepIndex][2]);
   digitalWrite(in4, seq[stepIndex][3]);
 }
+// --- HELPER: Normalize Angle ---
+float getAngle() {
+  // Convert steps to 0-360 degrees
+  long pos = currentStepPosition % STEPS_PER_REV;
+  if (pos < 0) pos += STEPS_PER_REV;
+  return (pos * 360.0f) / STEPS_PER_REV;
+}
 
+// --- UPDATED: Stepper Logic ---
 void rotateStepper(int steps, bool clockwise = true) {
   if (clockwise) {
     for (int i = 0; i < steps; i++) {
       stepMotor(i % 8);
       delay(stepDelay);
     }
+    currentStepPosition += steps; // Track Position
   } else {
     for (int i = steps - 1; i >= 0; i--) {
       stepMotor(i % 8);
       delay(stepDelay);
     }
+    currentStepPosition -= steps; // Track Position
   }
+  
+  // Release coils
   digitalWrite(in1, LOW); digitalWrite(in2, LOW);
   digitalWrite(in3, LOW); digitalWrite(in4, LOW);
 }
@@ -232,6 +248,7 @@ void sendStatusPacket() {
   float H = bme.readHumidity();
   float emc = calculateEMC(T, H);
   bool fanStatus = digitalRead(FAN_PIN);
+  float currentAngle = getAngle();
 
   // Average Moisture
   float avgM = 0;
@@ -245,6 +262,7 @@ void sendStatusPacket() {
   payload += ";H=" + String(H, 2);
   payload += ";EMC=" + String(emc, 2);
   payload += ";RACK=" + String(currentRack);
+  payload += ";ANG=" + String(currentAngle, 1);
   payload += ";FAN=" + String(fanStatus ? "1" : "0");
   payload += ";PRED=" + String(predMins);
   payload += ";MODE=" + String(currentMode);
@@ -266,6 +284,14 @@ void processCommand(String cmd) {
   if (cmd == "REQSTATUS") {
     sendStatusPacket();
   } 
+  else if (cmd == "PAUSEAUTO") {
+    autoSendEnabled = false;
+    // Optionally send a confirmation
+    // LoRa.beginPacket(); LoRa.print("AUTO_PAUSED"); LoRa.endPacket(); LoRa.receive();
+  }
+  else if (cmd == "RESUMEAUTO") {
+    autoSendEnabled = true;
+  }
   else if (cmd == "FANON") {
     digitalWrite(FAN_PIN, HIGH);
     sendStatusPacket(); 
@@ -334,7 +360,7 @@ void loop() {
   }
 
   // Periodic Update & Model Calc
-  if ((now - lastSend) >= SEND_INTERVAL) {
+  if (autoSendEnabled && (now - lastSend) >= SEND_INTERVAL) {
     lastSend = now;
     float emc = calculateEMC(T, H);
     float dt_min = (float)SEND_INTERVAL / 60000.0f;
