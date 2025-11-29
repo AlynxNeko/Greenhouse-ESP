@@ -1,4 +1,3 @@
-// [File: alynxneko/greenhouse-esp/Greenhouse-ESP-ce21ed56fcbaa14510252b1a6bbbb5005a9de09e/test_lora_sensor_node_auto/src/main.cpp]
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
@@ -51,6 +50,7 @@ const float TEMP_HOT = 30.0;
 const float TEMP_COOL = 25.0;
 
 const int STEPS_PER_REV = 4096; 
+const int STEPS_PER_RACK = STEPS_PER_REV / 8; // 512 steps per 45 degrees
 long currentStepPosition = 0;
 
 // GAB Model Parameters for EMC Calculation
@@ -170,13 +170,37 @@ void rotateStepper(int steps, bool clockwise = true) {
   digitalWrite(in3, LOW); digitalWrite(in4, LOW);
 }
 
-void shiftExposureMultipliers(bool clockwise=true) {
-  // Simplified shift for visualization logic
-  if (clockwise) {
-    float last = rack_k_multiplier[RACK_COUNT-1];
-    for (int i = RACK_COUNT-1; i>0; i--) rack_k_multiplier[i] = rack_k_multiplier[i-1];
-    rack_k_multiplier[0] = last;
-    currentRack = (currentRack % RACK_COUNT) + 1; 
+// Updates logical state (Current Rack ID and Bean Position)
+void updateLogicalPosition(int slotsMoved, bool clockwise) {
+  for(int s = 0; s < slotsMoved; s++) {
+    if (clockwise) {
+      // CW Rotation: Beans move 0 -> 1 -> 2.
+      // Shift rackM array RIGHT
+      float lastM = rackM[RACK_COUNT - 1];
+      for (int i = RACK_COUNT - 1; i > 0; i--) {
+        rackM[i] = rackM[i - 1];
+      }
+      rackM[0] = lastM;
+
+      // Update ID: Rack 1 at Top (0) moves to 1. Rack 8 comes to Top.
+      // So ID decrements: 1 -> 8 -> 7
+      currentRack--;
+      if (currentRack < 1) currentRack = RACK_COUNT; 
+
+    } else {
+      // CCW Rotation: Beans move 1 -> 0.
+      // Shift rackM array LEFT
+      float firstM = rackM[0];
+      for (int i = 0; i < RACK_COUNT - 1; i++) {
+        rackM[i] = rackM[i + 1];
+      }
+      rackM[RACK_COUNT - 1] = firstM;
+
+      // Update ID: Rack 2 (at 1) moves to Top (0).
+      // So ID increments: 1 -> 2 -> 3
+      currentRack++;
+      if (currentRack > RACK_COUNT) currentRack = 1;
+    }
   }
 }
 
@@ -286,11 +310,11 @@ void processCommand(String cmd) {
   } 
   else if (cmd == "PAUSEAUTO") {
     autoSendEnabled = false;
-    // Optionally send a confirmation
-    // LoRa.beginPacket(); LoRa.print("AUTO_PAUSED"); LoRa.endPacket(); LoRa.receive();
+    Serial.println("Auto Send PAUSED");
   }
   else if (cmd == "RESUMEAUTO") {
     autoSendEnabled = true;
+    Serial.println("Auto Send RESUMED");
   }
   else if (cmd == "FANON") {
     digitalWrite(FAN_PIN, HIGH);
@@ -301,15 +325,25 @@ void processCommand(String cmd) {
     sendStatusPacket();
   }
   else if (cmd == "NEXT") {
-    rotateStepper(512, true); // 45 deg
-    shiftExposureMultipliers(true);
+    rotateStepper(STEPS_PER_RACK, true); // 45 deg CW
+    updateLogicalPosition(1, true);
     sendStatusPacket();
   }
   else if (cmd.startsWith("STEP:")) {
     int angle = cmd.substring(5).toInt();
     bool cw = angle >= 0;
-    int steps = abs(angle) * (512.0 / 45.0);
+    int absAngle = abs(angle);
+    int steps = absAngle * (STEPS_PER_REV / 360.0);
+    
     rotateStepper(steps, cw);
+    
+    // Calculate how many full slots we moved approximately
+    // Round to nearest 45 degrees
+    int slots = (absAngle + 22) / 45; 
+    if (slots > 0) {
+      updateLogicalPosition(slots, cw);
+    }
+    
     sendStatusPacket(); 
   }
   else if (cmd.startsWith("SETMODE:")) {
