@@ -229,9 +229,7 @@ void processAutoLogic(float T) {
     Serial.println("Auto Logic: Rotating 180 deg...");
     // 180 degrees = approx 2048 steps (assuming 4096 per rev)
     rotateStepper(2048, true); 
-    shiftExposureMultipliers(true); 
-    shiftExposureMultipliers(true); // Shift logic twice since we moved 180 deg? (depends on logic mapping)
-    // Actually just shift once per significant move for simplicity or align with steps
+    updateLogicalPosition(4, true);
   }
 }
 
@@ -384,13 +382,13 @@ void loop() {
   float T = bme.readTemperature();
   float H = bme.readHumidity();
   
-  // Execute Auto Rotation Logic
-  processAutoLogic(T);
-
+  
   // Fan Logic (Hysteresis)
   if (currentMode == AUTO) {
-      if (H > 75.0f) digitalWrite(FAN_PIN, HIGH);
-      else if (H < 50.0f) digitalWrite(FAN_PIN, LOW);
+    if (H > 75.0f) digitalWrite(FAN_PIN, HIGH);
+    else if (H < 50.0f) digitalWrite(FAN_PIN, LOW);
+    // Execute Auto Rotation Logic
+    processAutoLogic(T);
   }
 
   // Periodic Update & Model Calc
