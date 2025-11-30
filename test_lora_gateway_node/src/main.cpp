@@ -44,7 +44,7 @@ void loop() {
       while (!offlineBuffer.empty()) {
         SerialBT.println(offlineBuffer.front());
         offlineBuffer.pop_front();
-        delay(20); // Small delay to not flood BT
+        delay(1300); // Small delay to not flood BT
       }
     }
   }
