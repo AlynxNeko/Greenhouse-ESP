@@ -53,6 +53,7 @@ void loop() {
   if (SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
     cmd.trim();
+    Serial.println("Sending via LoRa: " + cmd);
     if (cmd.length() > 0) {
       LoRa.beginPacket();
       LoRa.print(cmd);
