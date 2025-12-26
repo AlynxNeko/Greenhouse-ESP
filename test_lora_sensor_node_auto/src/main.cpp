@@ -11,9 +11,8 @@
 #define FAN_PIN   33 
 
 // --- Fan Logic Configuration ---
-// If your fan was "Off" when the pin was HIGH, it is Active LOW.
-#define FAN_ON    LOW
-#define FAN_OFF   HIGH
+#define FAN_ON    HIGH
+#define FAN_OFF   LOW
 
 // Stepper Pins (28BYJ-48 + ULN2003)
 const int in1 = 13;
@@ -39,7 +38,7 @@ const uint8_t seq[8][4] = {
 };
 
 // ------------------ LOGIC & STATE ------------------
-const float k_drying = 0.0025; 
+const float k_drying = 0.0003; 
 const int RACK_COUNT = 8;
 int currentRack = 1;            
 float rackM[RACK_COUNT];        
@@ -69,13 +68,14 @@ long currentStepPosition = 0;
 // Alert Flags (Sent to App)
 bool alertRotate = false;
 bool alertFan = false;
+bool alertDry = false;
 
 // GAB Model Parameters
 struct GabParams { float M0; float C; float K; float T; };
 const GabParams gabTable[] = {
-  {5.50, 20.0, 0.88, 25.0}, 
-  {5.00, 18.0, 0.86, 32.0}, 
-  {4.50, 15.0, 0.84, 39.0} 
+  {8.85, 6.45, 0.85, 25.0}, 
+  {8.50, 6.00, 0.87, 35.0}, 
+  {8.00, 5.50, 0.89, 45.0} 
 };
 
 // ------------------ HELPER FUNCTIONS ------------------
@@ -186,44 +186,72 @@ void updateLogicalPosition(int slotsMoved, bool clockwise) {
 void evaluateSystemLogic(float T, float H) {
   unsigned long now = millis();
   
-  // 1. Determine Rotation Interval (Logic runs in all modes)
+  // --- A. Rotation Logic (Time Based) ---
   unsigned long interval;
-  if (T > TEMP_HOT) interval = 30 * 1000UL;            // >30C: 30s
-  else if (T >= TEMP_COOL) interval = 2 * 60 * 1000UL; // 25-30C: 2m
-  else interval = 10 * 60 * 1000UL;                    // <25C: 10m
+  if (T > TEMP_HOT) interval = 10 * 1000UL;            // >30C: 10s
+  else if (T >= TEMP_COOL) interval = 15 * 1000UL; // 25-30C: 15s
+  else interval = 20 * 1000UL;                         // <25C: 20s
 
-  // Check if Rotation is Due
   if (now - lastRotationTime > interval) {
-    alertRotate = true; // Set Flag
+    alertRotate = true; 
   }
 
-  // 2. Determine Fan Need (Logic runs in all modes)
-  if (H > HUM_HIGH) {
-    alertFan = true; // Too humid
-  } else if (H < HUM_LOW) {
-    alertFan = false; // Dry enough
+  // --- B. Fan Logic (Humidity Based) ---Determine Fan Need (EMC-Based Logic)
+  // Calculate what moisture the AIR would force the beans to.
+  float airEMC = calculateEMC(T, H);
+  
+  // Average bean moisture
+  float currentBeanM = 0;
+  for(float m : rackM) currentBeanM += m;
+  currentBeanM /= RACK_COUNT;
+
+  // Hysteresis buffer (0.5%) to prevent rapid toggling
+  if (airEMC < (currentBeanM - 0.5)) {
+    // The air is DRIER than the beans. Fan helps drying.
+    alertFan = true; 
+  } else if (airEMC > currentBeanM) {
+    // The air is WETTER than the beans. Fan will re-wet them!
+    alertFan = false;
+  }
+  else {
+    // Within hysteresis range, maintain current state.
+    if (H > HUM_HIGH) {
+      alertFan = true; 
+    } else if (H < HUM_LOW) {
+      alertFan = false; 
+    }
   }
 
-  // 3. AUTO MODE: Act on the alerts immediately
+  // --- C. NEW: Dry/Harvest Logic (Moisture Based) ---
+  float avgM = 0;
+  for(float m : rackM) avgM += m;
+  avgM /= RACK_COUNT;
+
+  // Trigger alert if average moisture is below or equal to target (12.0)
+  if (avgM <= M_TARGET) {
+    alertDry = true;
+  } else {
+    alertDry = false;
+  }
+
+  // --- D. AUTO MODE ACTIONS ---
   if (currentMode == AUTO) {
-    // Handle Rotation
+    // Action 1: Rotate
     if (alertRotate) {
       Serial.println("Auto: Rotating 180 deg...");
       rotateStepper(2048, true); 
       updateLogicalPosition(4, true);
       lastRotationTime = millis(); 
-      alertRotate = false; // Action taken, clear alert
+      alertRotate = false; 
     }
 
-    // Handle Fan
+    // Action 2: Fan
     if (alertFan) {
       digitalWrite(FAN_PIN, FAN_ON);
     } else {
       digitalWrite(FAN_PIN, FAN_OFF);
     }
   }
-  // SEMI/NOTIFY Modes: We do NOT act. We keep `alertRotate` and `alertFan` true.
-  // The App will receive these flags and notify the user.
 }
 
 // --- SETUP ---
@@ -253,9 +281,7 @@ void sendStatusPacket() {
   float H = bme.readHumidity();
   float emc = calculateEMC(T, H);
   
-  // Logical Status: Is it ON? (Not just is the pin high)
   bool isFanOn = (digitalRead(FAN_PIN) == FAN_ON); 
-  
   float currentAngle = getAngle();
 
   float avgM = 0;
@@ -273,8 +299,11 @@ void sendStatusPacket() {
   payload += ";PRED=" + String(predMins);
   payload += ";MODE=" + String(currentMode);
   
-  // Send Alerts: 1=Rotate, 2=Fan, 3=Both
-  int alertCode = (alertRotate ? 1 : 0) + (alertFan ? 2 : 0);
+  // --- UPDATED ALERT CALCULATION ---
+  // Bit 0 (1) = Rotate
+  // Bit 1 (2) = Fan
+  // Bit 2 (4) = Dry (NEW)
+  int alertCode = (alertRotate ? 1 : 0) + (alertFan ? 2 : 0) + (alertDry ? 4 : 0);
   payload += ";ALERT=" + String(alertCode); 
   
   payload += ";M_DATA="; 
