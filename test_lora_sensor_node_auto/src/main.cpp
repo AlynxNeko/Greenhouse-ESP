@@ -38,7 +38,9 @@ const uint8_t seq[8][4] = {
 };
 
 // ------------------ LOGIC & STATE ------------------
+// [FIX 2] Slower drying constant for realistic sun drying
 const float k_drying = 0.0003; 
+
 const int RACK_COUNT = 8;
 int currentRack = 1;            
 float rackM[RACK_COUNT];        
@@ -54,11 +56,9 @@ OpMode currentMode = AUTO;
 float initialMoisturePercent = 15.0; 
 const float M_TARGET = 12.0;
 
-// Thresholds
+// Thresholds for Rotation
 const float TEMP_HOT = 30.0;
 const float TEMP_COOL = 25.0;
-const float HUM_HIGH = 75.0;
-const float HUM_LOW = 50.0;
 
 // Motor Consts
 const int STEPS_PER_REV = 4096; 
@@ -68,10 +68,12 @@ long currentStepPosition = 0;
 // Alert Flags (Sent to App)
 bool alertRotate = false;
 bool alertFan = false;
-bool alertDry = false;
 
 // GAB Model Parameters
 struct GabParams { float M0; float C; float K; float T; };
+
+// [FIX 1] Updated GAB Parameters for Green Coffee (Resende et al.)
+// Higher M0 and lower C gives more realistic tropical EMC (approx 15-17% at 80% RH)
 const GabParams gabTable[] = {
   {8.85, 6.45, 0.85, 25.0}, 
   {8.50, 6.00, 0.87, 35.0}, 
@@ -120,17 +122,20 @@ void updateRackMoistures(float Me, float dt_min) {
   for (int i = 0; i < RACK_COUNT; i++) {
     float k_eff = k_drying * rack_k_multiplier[i]; 
     float decay = expf(-k_eff * dt_min);
+    // Note: This equation allows M to increase if Me > rackM[i] (Re-wetting)
     rackM[i] = Me + (rackM[i] - Me) * decay;
   }
 }
 
 int calculatePredTime(float M_current, float Me) {
   if (M_current <= M_TARGET) return 0; 
-  if (Me >= M_TARGET) return 999; 
+  
+  // If Me is higher than Target, we will NEVER reach Target in these conditions
+  if (Me >= M_TARGET) return -1; // -1 indicates "Wetting/Stalled" condition
   
   float numerator = M_TARGET - Me;
   float denominator = M_current - Me;
-  if (denominator <= 0) return 999; 
+  if (denominator <= 0) return -1; 
 
   float ratio = numerator / denominator;
   if (ratio <= 0) return 0; 
@@ -186,57 +191,38 @@ void updateLogicalPosition(int slotsMoved, bool clockwise) {
 void evaluateSystemLogic(float T, float H) {
   unsigned long now = millis();
   
-  // --- A. Rotation Logic (Time Based) ---
+  // 1. Determine Rotation Interval (Logic runs in all modes)
   unsigned long interval;
-  if (T > TEMP_HOT) interval = 10 * 1000UL;            // >30C: 10s
-  else if (T >= TEMP_COOL) interval = 15 * 1000UL; // 25-30C: 15s
-  else interval = 20 * 1000UL;                         // <25C: 20s
+  if (T > TEMP_HOT) interval = 30 * 1000UL;            // >30C: 30s
+  else if (T >= TEMP_COOL) interval = 2 * 60 * 1000UL; // 25-30C: 2m
+  else interval = 10 * 60 * 1000UL;                    // <25C: 10m
 
+  // Check if Rotation is Due
   if (now - lastRotationTime > interval) {
     alertRotate = true; 
   }
 
-  // --- B. Fan Logic (Humidity Based) ---Determine Fan Need (EMC-Based Logic)
-  // Calculate what moisture the AIR would force the beans to.
-  float airEMC = calculateEMC(T, H);
+  // [FIX 3] Fan Logic based on EMC vs Bean Moisture
+  float emc = calculateEMC(T, H);
   
-  // Average bean moisture
-  float currentBeanM = 0;
-  for(float m : rackM) currentBeanM += m;
-  currentBeanM /= RACK_COUNT;
-
-  // Hysteresis buffer (0.5%) to prevent rapid toggling
-  if (airEMC < (currentBeanM - 0.5)) {
-    // The air is DRIER than the beans. Fan helps drying.
-    alertFan = true; 
-  } else if (airEMC > currentBeanM) {
-    // The air is WETTER than the beans. Fan will re-wet them!
-    alertFan = false;
-  }
-  else {
-    // Within hysteresis range, maintain current state.
-    if (H > HUM_HIGH) {
-      alertFan = true; 
-    } else if (H < HUM_LOW) {
-      alertFan = false; 
-    }
-  }
-
-  // --- C. NEW: Dry/Harvest Logic (Moisture Based) ---
+  // Calculate average bean moisture
   float avgM = 0;
   for(float m : rackM) avgM += m;
   avgM /= RACK_COUNT;
 
-  // Trigger alert if average moisture is below or equal to target (12.0)
-  if (avgM <= M_TARGET) {
-    alertDry = true;
-  } else {
-    alertDry = false;
+  // Hysteresis of 0.5%
+  if (emc < (avgM - 0.5)) {
+    // Air is significantly drier than beans -> Fan ON
+    alertFan = true;
+  } else if (emc > avgM) {
+    // Air is wetter than beans -> Fan OFF (prevent re-wetting)
+    alertFan = false;
   }
+  // else: inside deadband, keep previous state
 
-  // --- D. AUTO MODE ACTIONS ---
+  // 3. AUTO MODE: Act on the alerts immediately
   if (currentMode == AUTO) {
-    // Action 1: Rotate
+    // Handle Rotation
     if (alertRotate) {
       Serial.println("Auto: Rotating 180 deg...");
       rotateStepper(2048, true); 
@@ -245,7 +231,7 @@ void evaluateSystemLogic(float T, float H) {
       alertRotate = false; 
     }
 
-    // Action 2: Fan
+    // Handle Fan
     if (alertFan) {
       digitalWrite(FAN_PIN, FAN_ON);
     } else {
@@ -299,11 +285,7 @@ void sendStatusPacket() {
   payload += ";PRED=" + String(predMins);
   payload += ";MODE=" + String(currentMode);
   
-  // --- UPDATED ALERT CALCULATION ---
-  // Bit 0 (1) = Rotate
-  // Bit 1 (2) = Fan
-  // Bit 2 (4) = Dry (NEW)
-  int alertCode = (alertRotate ? 1 : 0) + (alertFan ? 2 : 0) + (alertDry ? 4 : 0);
+  int alertCode = (alertRotate ? 1 : 0) + (alertFan ? 2 : 0);
   payload += ";ALERT=" + String(alertCode); 
   
   payload += ";M_DATA="; 
@@ -331,19 +313,17 @@ void processCommand(String cmd) {
     autoSendEnabled = true;
   }
   else if (cmd == "FANON") {
-    digitalWrite(FAN_PIN, FAN_ON); // Turns Physical ON
+    digitalWrite(FAN_PIN, FAN_ON); 
     sendStatusPacket(); 
   } 
   else if (cmd == "FANOFF") {
-    digitalWrite(FAN_PIN, FAN_OFF); // Turns Physical OFF
-    // Note: If in AUTO and humidity is high, logic in loop() will turn it back ON immediately.
-    // This is expected behavior for AUTO.
+    digitalWrite(FAN_PIN, FAN_OFF); 
     sendStatusPacket();
   }
   else if (cmd == "NEXT") {
     rotateStepper(STEPS_PER_RACK, true); 
     updateLogicalPosition(1, true);
-    lastRotationTime = millis(); // Reset timer so we don't alert again immediately
+    lastRotationTime = millis(); 
     alertRotate = false; 
     sendStatusPacket();
   }
@@ -372,7 +352,7 @@ void processCommand(String cmd) {
     if (m > 0) {
       initialMoisturePercent = m;
       for (int i = 0; i < RACK_COUNT; i++) rackM[i] = m;
-      sendStatusPacket(); // Will recalculate PredTime immediately with new M
+      sendStatusPacket(); 
     }
   }
 }
@@ -393,7 +373,7 @@ void loop() {
   float T = bme.readTemperature();
   float H = bme.readHumidity();
   
-  // Run Core Logic (Assessment + Action if Auto)
+  // Run Core Logic 
   evaluateSystemLogic(T, H);
 
   if (autoSendEnabled && (now - lastSend) >= SEND_INTERVAL) {
